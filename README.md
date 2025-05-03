@@ -1,4 +1,5 @@
 ## 🧠 AutoSmug Album Scanner
+https://www.smugmug.com/
 
 **Educational Tool for API-less Album Scanning**
 
