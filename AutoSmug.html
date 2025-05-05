@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AutoSmug Album Scanner</title>
   <style>
     body {
@@ -77,6 +77,12 @@
       margin-bottom: 20px;
       font-weight: bold;
     }
+    .search-db {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      margin-top: 40px;
+    }
     footer {
       text-align: center;
       font-size: 14px;
@@ -88,36 +94,94 @@
 <body>
   <h1>AutoSmug Album Scanner</h1>
   <div class="form">
-    <input type="text" id="albumKeyword" placeholder="Enter album keyword to match">
     <input type="number" id="scanDuration" placeholder="Run time (minutes)" min="1">
     <button onclick="toggleScan()" id="scanBtn">Start Scan</button>
     <button onclick="resetScannedUsers()">Reset Scanned</button>
+    <button onclick="clearEverything()">Clear Everything</button>
+    <button id="refreshUploadBtn" onclick="refreshUploadDates()">🔄 Refresh Upload Dates</button>
+    <button id="refreshAllBtn" onclick="refreshAllUserData()">🛠 Refresh All Data</button>
+    <span id="refreshUploadStatus" style="font-size: 14px; color: #666;"></span>
   </div>
-  <div class="toggle-buttons">
+  </div>
+  
+  <div id="errorBox"></div>
+  <div id="progress"></div>
+  <div id="scanStats" style="text-align: center; margin-bottom: 20px; font-size: 16px; color: #555;"></div>
+  
+  <div id="logOutput"></div>
+  <hr style="margin: 40px 0; border: none; border-top: 2px solid #ccc;">
+  <h2 style="text-align:center; font-size: 20px; margin-bottom: 10px; color: #555;">Search Local Album Database</h2>
+  <div class="search-db">
+  <div id="dbStats" style="font-size: 14px; color: #666; margin-right: 20px;"></div>
+  <input type="text" id="albumSearchInput" placeholder="Search albums from local DB">
+  <button onclick="searchFromDB()">Search</button>
+</div>
+<div class="toggle-buttons">
     <button onclick="toggleAll(true)">Expand All</button>
     <button onclick="toggleAll(false)">Collapse All</button>
   </div>
-  <div id="errorBox"></div>
-  <div id="progress"></div>
   <div id="results"></div>
-  <div id="logOutput"></div>
+  
+  
   <footer>
     <strong>Th*eCu*rat*or1.0</strong>
   </footer>
 
   <script>
-    const scannedUsers = new Set(JSON.parse(localStorage.getItem('scannedUsersAuto') || '[]'));
-    const scannedAlbums = new Set(JSON.parse(localStorage.getItem('scannedAlbumsAuto') || '[]'));
-    const albumHitsByKeyword = JSON.parse(localStorage.getItem('albumHitsByKeyword') || '{}');
-    const concurrencyLimit = 5;
-    const logOutput = document.getElementById("logOutput");
-    const results = document.getElementById("results");
+    class DBManager {
+      constructor() {
+        this.dbName = 'autoSmugDB';
+        this.storeName = 'users';
+      }
+
+      async init() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(this.dbName, 1);
+          request.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(this.storeName)) {
+              db.createObjectStore(this.storeName, { keyPath: 'user.NickName' });
+            }
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async save(entry) {
+        const db = await this.init();
+        const tx = db.transaction(this.storeName, 'readwrite');
+        tx.objectStore(this.storeName).put(entry);
+        return tx.complete;
+      }
+
+      async getAll() {
+        const db = await this.init();
+        return new Promise((resolve) => {
+          const tx = db.transaction(this.storeName, 'readonly');
+          const store = tx.objectStore(this.storeName);
+          const request = store.getAll();
+          request.onsuccess = () => resolve(request.result);
+        });
+      }
+
+      async clear() {
+        const db = await this.init();
+        const tx = db.transaction(this.storeName, 'readwrite');
+        tx.objectStore(this.storeName).clear();
+        return tx.complete;
+      }
+    }
+
+    const dbManager = new DBManager();
+    const charset = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    const scannedUsers = new Set();
     const scanBtn = document.getElementById("scanBtn");
+    const logOutput = document.getElementById("logOutput");
     let running = false;
     let scanStart = null;
     let queryIndex = parseInt(localStorage.getItem('lastQueryIndex') || '0');
     let timerId = null;
-    const charset = 'abcdefghijklmnopqrstuvwxyz0123456789';
 
     function log(message) {
       const timestamp = new Date().toLocaleTimeString();
@@ -127,6 +191,7 @@
     }
 
     function toggleScan() {
+      updateScanStats();
       running = !running;
       scanBtn.textContent = running ? "Pause Scan" : "Start Scan";
       if (running) {
@@ -139,18 +204,18 @@
             log("Scan stopped automatically after timeout.");
           }, minutes * 60000);
         }
-        checkExistingResults();
+        scanLoop();
       } else {
         clearTimeout(timerId);
       }
     }
 
     function resetScannedUsers() {
-      localStorage.clear();
+      updateScanStats();
+      updateDBStats([]);
+      dbManager.clear();
       scannedUsers.clear();
-      scannedAlbums.clear();
       log("Scanned data reset.");
-      updateProgress();
     }
 
     function toggleAll(expand) {
@@ -159,33 +224,20 @@
       });
     }
 
-    function updateProgress() {
-      document.getElementById("progress").textContent = `Users scanned: ${scannedUsers.size} | Matching albums: ${scannedAlbums.size}`;
-    }
-
     function generateQuery(index) {
-      let base = '';
-      let n = index;
-      while (n >= 0) {
-        base = charset[n % charset.length] + base;
-        n = Math.floor(n / charset.length) - 1;
-      }
-      return base;
+  let base = '';
+  let n = index + Math.pow(charset.length, 2) * 26; // התחלה מ-'aaa'
+  while (n >= 0) {
+    base = charset[n % charset.length] + base;
+    n = Math.floor(n / charset.length) - 1;
+  }
+  return base;
     }
 
-    function checkExistingResults() {
-      const keyword = document.getElementById("albumKeyword").value.toLowerCase();
-      const existing = albumHitsByKeyword[keyword] || [];
-      results.innerHTML = '';
-      if (existing.length > 0) {
-        log(`Loaded ${existing.length} cached results for '${keyword}'`);
-        existing.forEach(entry => renderUser(entry.user, entry.albums));
-        updateProgress();
-      }
-      scanLoop();
-    }
-
-    function extractJsonBlockByKey(html, key = "User") {
+    async function fetchHtmlAndExtractJson(url, key = "User") {
+      log(`Fetching URL: ${url}`);
+      const response = await fetch(url);
+      const html = await response.text();
       const matches = html.matchAll(/<pre>([\s\S]*?)<\/pre>/g);
       for (const match of matches) {
         try {
@@ -202,16 +254,8 @@
       throw new Error("No valid JSON block found");
     }
 
-    async function fetchHtmlAndExtractJson(url, key = "User") {
-      log(`Fetching URL: ${url}`);
-      const response = await fetch(url);
-      const html = await response.text();
-      return extractJsonBlockByKey(html, key);
-    }
-
     async function scanLoop() {
       if (!running) return;
-      const keyword = document.getElementById("albumKeyword").value.toLowerCase();
       const query = generateQuery(queryIndex++);
       localStorage.setItem('lastQueryIndex', queryIndex);
       log(`Scanning with query: '${query}'`);
@@ -222,26 +266,27 @@
         const tasks = users.map(user => async () => {
           if (scannedUsers.has(user.NickName)) return;
           scannedUsers.add(user.NickName);
-          localStorage.setItem('scannedUsersAuto', JSON.stringify([...scannedUsers]));
+          updateScanStats();
           log(`Scanning user: ${user.NickName}`);
           try {
             const albumJson = await fetchHtmlAndExtractJson(`https://api.smugmug.com/api/v2/user/${user.NickName}!albums`, 'Album');
             const albums = albumJson.Response?.Album || [];
-            const matching = albums.filter(a => a.Title?.toLowerCase().includes(keyword));
-            matching.forEach(album => scannedAlbums.add(album.AlbumKey));
-            localStorage.setItem('scannedAlbumsAuto', JSON.stringify([...scannedAlbums]));
-            if (matching.length) {
-              if (!albumHitsByKeyword[keyword]) albumHitsByKeyword[keyword] = [];
-              albumHitsByKeyword[keyword].push({ user, albums: matching });
-              localStorage.setItem('albumHitsByKeyword', JSON.stringify(albumHitsByKeyword));
-              renderUser(user, matching);
+            let lastUpload = null;
+            try {
+              const recentJson = await fetchHtmlAndExtractJson(`https://api.smugmug.com/api/v2/user/${user.NickName}!recentimages?MediaType=All&start=1&count=1`, 'Image');
+              const image = recentJson.Response?.Image?.[0];
+              if (image?.DateTimeUploaded) lastUpload = image.DateTimeUploaded;
+            } catch (err) {
+              log(`Could not get last upload date for ${user.NickName}: ${err.message}`);
             }
-            updateProgress();
+            user.lastUpload = lastUpload;
+            const entry = { user, albums, lastUpload };
+            await dbManager.save(entry);
           } catch (err) {
             log(`User error: ${user.NickName} - ${err.message}`);
           }
         });
-        await queueTasks(tasks, concurrencyLimit);
+        await queueTasks(tasks, 12);
       } catch (e) {
         log(`Query error '${query}': ${e.message}`);
       }
@@ -261,13 +306,36 @@
       return Promise.all(results);
     }
 
+    async function searchFromDB() {
+      const keyword = document.getElementById("albumSearchInput").value.toLowerCase();
+      const resultsContainer = document.getElementById("results");
+      resultsContainer.innerHTML = '';
+      const users = await dbManager.getAll();
+      let matched = 0;
+      users.sort((a, b) => new Date(b.lastUpload || 0) - new Date(a.lastUpload || 0));
+      users.forEach(entry => {
+        const matches = entry.albums.filter(a => a.Title?.toLowerCase().includes(keyword));
+        if (matches.length > 0) {
+          renderUser(entry.user, matches);
+          matched++;
+        }
+      });
+      log(`Found ${matched} users with albums matching '${keyword}'`);
+      const totalUsers = users.length;
+      const totalAlbums = users.reduce((sum, u) => sum + (u.albums?.length || 0), 0);
+      document.getElementById('dbStats').textContent = `Users in DB: ${totalUsers} | Albums: ${totalAlbums} | Matching: ${matched}`;
+      updateDBStats(users, matched);
+    }
+
     function renderUser(user, albums) {
+      const results = document.getElementById("results");
       const container = document.createElement("div");
       container.className = "user-container";
 
       const header = document.createElement("div");
       header.className = "user-header";
-      header.innerHTML = `<a href="${user.WebUri}" target="_blank">${user.NickName}</a>`;
+      const updatedInfo = user.lastUpload ? ` <span style=\"color: #888; font-size: 13px;\">(${new Date(user.lastUpload).toLocaleDateString()})</span>` : '';
+      header.innerHTML = `<a href=\"${user.WebUri}\" target=\"_blank\">${user.NickName}</a>${updatedInfo}`;
 
       const content = document.createElement("div");
       content.className = "user-content";
@@ -299,6 +367,158 @@
       container.appendChild(content);
       results.appendChild(container);
     }
-  </script>
+  function updateScanStats() {
+  document.getElementById('scanStats').textContent = `Users scanned this session: ${scannedUsers.size}`;
+}
+
+function updateDBStats(users, matched = null) {
+  const totalUsers = users.length;
+  const totalAlbums = users.reduce((sum, u) => sum + (u.albums?.length || 0), 0);
+  let text = `Users in DB: ${totalUsers} | Albums: ${totalAlbums}`;
+  if (matched !== null) text += ` | Matching: ${matched}`;
+  document.getElementById('dbStats').textContent = text;
+}
+async function clearOldEntries() {
+  const all = await dbManager.getAll();
+  const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const fresh = all.filter(entry => new Date(entry.lastUpload || 0).getTime() >= oneWeekAgo);
+  const db = await dbManager.init();
+  const tx = db.transaction(dbManager.storeName, 'readwrite');
+  const store = tx.objectStore(dbManager.storeName);
+  await store.clear();
+  for (const entry of fresh) {
+    store.put(entry);
+  }
+  await tx.complete;
+  log(`Cleared old entries. Remaining users: ${fresh.length}`);
+  updateDBStats(fresh);
+  searchFromDB();
+}
+function clearEverything() {
+  if (!confirm("Are you sure you want to completely reset the system? This will delete all saved data.")) return;
+  indexedDB.deleteDatabase(dbManager.dbName);
+  localStorage.clear();
+  scannedUsers.clear();
+  log("Everything cleared: DB, localStorage, memory.");
+  updateDBStats([]);
+  updateScanStats();
+  document.getElementById('results').innerHTML = '';
+}
+async function refreshUploadDates() {
+  if (window.refreshingUpload) {
+    log("Paused upload date refresh.");
+    document.getElementById('refreshUploadBtn').textContent = '🔄 Resume Upload Dates';
+    window.pausedRefreshUpload = true;
+    window.refreshingUpload = false;
+    return;
+  }
+  window.pausedRefreshUpload = false;
+  document.getElementById('refreshUploadBtn').textContent = '🔄 Pause Upload Dates';
+  window.refreshingUpload = true;
+  if (running) {
+    log("Stopping scan to refresh upload dates...");
+    running = false;
+    scanBtn.textContent = "Start Scan";
+    clearTimeout(timerId);
+  }
+  const statusEl = document.getElementById('refreshUploadStatus');
+  statusEl.textContent = 'Refreshing...';
+  const users = await dbManager.getAll();
+  let updated = 0;
+  let pausedRefreshAll = false;
+  let pausedRefreshUpload = false;
+  const updatedUsers = [];
+  let total = users.length;
+  const tasks = users.map((entry, i) => async () => {
+    if (pausedRefreshAll) return;
+    if (pausedRefreshUpload) return;
+    statusEl.textContent = `Refreshing upload dates... (${i + 1}/${total})`;
+    try {
+      const json = await fetchHtmlAndExtractJson(`https://api.smugmug.com/api/v2/user/${entry.user.NickName}!recentimages?MediaType=All&start=1&count=1`, 'Image');
+      const image = json.Response?.Image?.[0];
+      if (image?.DateTimeUploaded) {
+        entry.user.lastUpload = image.DateTimeUploaded;
+        entry.lastUpload = image.DateTimeUploaded;
+        updated++;
+      }
+    } catch (e) {
+      log(`Could not refresh upload date for ${entry.user.NickName}: ${e.message}`);
+    }
+    updatedUsers.push(entry);
+  });
+  await queueTasks(tasks, 12);
+  const db = await dbManager.init();
+  const tx = db.transaction(dbManager.storeName, 'readwrite');
+  const store = tx.objectStore(dbManager.storeName);
+  await store.clear();
+  for (const u of updatedUsers) {
+    store.put(u);
+  }
+  await tx.complete;
+  window.refreshingUpload = false;
+  log(`Refreshed upload dates for ${updated} users.`);
+  statusEl.textContent = `Last updated: ${new Date().toLocaleString()}`;
+  searchFromDB();
+}
+async function refreshAllUserData() {
+  if (window.refreshingAll) {
+    log("Paused full data refresh.");
+    document.getElementById('refreshAllBtn').textContent = '🛠 Resume All Data';
+    window.pausedRefreshAll = true;
+    window.refreshingAll = false;
+    return;
+  }
+  window.pausedRefreshAll = false;
+  document.getElementById('refreshAllBtn').textContent = '🛠 Pause All Data';
+  window.refreshingAll = true;
+  if (running) {
+    log("Stopping scan to refresh all user data...");
+    running = false;
+    scanBtn.textContent = "Start Scan";
+    clearTimeout(timerId);
+  }
+  const statusEl = document.getElementById('refreshUploadStatus');
+  statusEl.textContent = 'Refreshing all user data...';
+  const users = await dbManager.getAll();
+  let updated = 0;
+  const refreshedUsers = [];
+  let total = users.length;
+  const tasks = users.map((entry, i) => async () => {
+    statusEl.textContent = `Refreshing all user data... (${i + 1}/${total})`;
+    try {
+      const albumJson = await fetchHtmlAndExtractJson(`https://api.smugmug.com/api/v2/user/${entry.user.NickName}!albums`, 'Album');
+      const albums = albumJson.Response?.Album || [];
+      let lastUpload = null;
+      try {
+        const recentJson = await fetchHtmlAndExtractJson(`https://api.smugmug.com/api/v2/user/${entry.user.NickName}!recentimages?MediaType=All&start=1&count=1`, 'Image');
+        const image = recentJson.Response?.Image?.[0];
+        if (image?.DateTimeUploaded) lastUpload = image.DateTimeUploaded;
+      } catch (err) {
+        log(`No recent upload found for ${entry.user.NickName}`);
+      }
+      entry.user.lastUpload = lastUpload;
+      entry.albums = albums;
+      entry.lastUpload = lastUpload;
+      refreshedUsers.push(entry);
+      updated++;
+    } catch (e) {
+      log(`Failed to refresh data for ${entry.user.NickName}: ${e.message}`);
+    }
+  });
+  await queueTasks(tasks, 12);
+  const db = await dbManager.init();
+  const tx = db.transaction(dbManager.storeName, 'readwrite');
+  const store = tx.objectStore(dbManager.storeName);
+  await store.clear();
+  for (const entry of refreshedUsers) {
+    store.put(entry);
+  }
+  await tx.complete;
+  window.refreshingAll = false;
+  log(`Refreshed full data for ${updated} users.`);
+  statusEl.textContent = `Last full update: ${new Date().toLocaleString()}`;
+  searchFromDB();
+}
+</script>
 </body>
 </html>
